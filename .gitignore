@@ -1,0 +1,4 @@
+packages/
+*.dll
+obj/
+Redis.Web/Redis.Web.csproj.user
