@@ -3,3 +3,6 @@ packages/
 obj/
 Redis.Web/Redis.Web.csproj.user
 Redis.Samples.v11.suo
+Redis.Web/bin
+.nuget/
+*.suo
