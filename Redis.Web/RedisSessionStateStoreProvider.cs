@@ -78,13 +78,12 @@ namespace Redis.Web
         {
             var cached = Database.StringGet(id);
             var item = DeserializeSessionItem(cached);
-
+            
             item.Locked = false;
             item.Expires = DateTime.UtcNow.AddMinutes(_configSection.Timeout.TotalMinutes);
             cached = SerializeSessionItem(item);
 
             Database.StringSet(id, cached);
-            Database.KeyExpire(id, item.Expires);
         }
 
        
@@ -107,7 +106,7 @@ namespace Redis.Web
                     LockDate = utcNow,
                     LockId = 0,
                     Timeout = item.Timeout,
-                    SessionItems = string.Empty,
+                    SessionItems = items,
                     Flags = (int)SessionStateActions.None
                 };
             }
@@ -124,7 +123,6 @@ namespace Redis.Web
 
             cached = SerializeSessionItem(sessionItem);
             Database.StringSet(id, cached);
-            Database.KeyExpire(id, sessionItem.Expires);
         }
 
         public override void RemoveItem(HttpContext context, string id, object lockId, SessionStateStoreData item)
@@ -150,7 +148,6 @@ namespace Redis.Web
             cached = SerializeSessionItem(sessionItem);
 
             Database.StringSet(id, cached);
-            Database.KeyExpire(id, sessionItem.Expires);
         }
 
         public override SessionStateStoreData CreateNewStoreData(HttpContext context, int timeout)
@@ -168,7 +165,7 @@ namespace Redis.Web
             {
                 SessionId = id,
                 Created = utcNow,
-                Expires = utcNow,
+                Expires = utcNow.AddMinutes(timeout),
                 LockDate = utcNow,
                 LockId = 0,
                 Timeout = timeout,
@@ -178,7 +175,6 @@ namespace Redis.Web
             };
             var serialized = SerializeSessionItem(item);
             Database.StringSet(id, serialized);
-            Database.KeyExpire(id, utcNow.AddMinutes(timeout));
         }
 
         public override void EndRequest(HttpContext context)
@@ -198,17 +194,17 @@ namespace Redis.Web
             SessionStateStoreData item = null;
             string sessionItems = null;
             int timeout = 0;
+            bool deleteData = false;
+            bool foundRecord = false;
 
             lockAge = TimeSpan.Zero;
             lockId = null;
             locked = false;
             actionFlags = SessionStateActions.None;
             string cached = Database.StringGet(id);
-            var deleteData = false;
-
+           
             if (string.IsNullOrEmpty(cached))
             {
-                locked = false;
                 return item;
             }
 
@@ -216,9 +212,9 @@ namespace Redis.Web
 
             if (lockRecord)
             {
-                
 
-                if (cachedItem.Locked != true)
+
+                if (cachedItem.Locked != true && cachedItem.Expires > DateTime.UtcNow)
                 {
                     cachedItem.Locked = true;
                     cachedItem.LockDate = DateTime.UtcNow;
@@ -226,14 +222,23 @@ namespace Redis.Web
                     cached = JsonConvert.SerializeObject(cachedItem);
                     Database.StringSet(id, cached);
                 }
+                else
+                {
+                    locked = true;
+                }
 
-                locked = true;
+
             }
 
             var expires = cachedItem.Expires;
             if (expires < DateTime.UtcNow)
             {
                 locked = false;
+                deleteData = true;
+            }
+            else
+            {
+                foundRecord = true;
             }
 
             sessionItems = cachedItem.SessionItems;
@@ -242,7 +247,11 @@ namespace Redis.Web
             actionFlags = (SessionStateActions) cachedItem.Flags;
             timeout = cachedItem.Timeout;
 
-            if (!locked)
+            if (deleteData)
+                Database.KeyDelete(id);
+
+            
+            if (foundRecord && !locked)
             {
                 lockId = (int) lockId + 1;
                 cachedItem.LockId = (int) lockId;
