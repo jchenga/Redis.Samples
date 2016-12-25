@@ -4,6 +4,7 @@ using System.Configuration;
 using System.IO;
 using System.Web;
 using System.Web.Configuration;
+using System.Web.Hosting;
 using System.Web.Mvc;
 using System.Web.SessionState;
 using Newtonsoft.Json;
@@ -29,7 +30,9 @@ namespace Redis.Web
         private RedisConnectionProvider _redisConnectionProvider;
         private string _connectionString;
         private SessionStateSection _configSection;
+        private string _applicationName;
 
+        // initialize the provider
         public override void Initialize(string name, NameValueCollection config)
         {
            
@@ -43,17 +46,21 @@ namespace Redis.Web
 
             }
             base.Initialize(name, config);
+
             _configSection = (SessionStateSection) ConfigurationManager.GetSection("system.web/sessionState");
             _connectionString = ConfigurationManager.ConnectionStrings["Redi.SessionState.Store"].ConnectionString;
             _redisConnectionProvider = new RedisConnectionProvider();
+            _applicationName = HostingEnvironment.ApplicationVirtualPath;
         }
 
         private IDatabase Database {get { return _redisConnectionProvider.GetConnection(_connectionString).GetDatabase(); }}
-        
+
         public override void Dispose()
         {
+            _redisConnectionProvider.Dispose();
         }
 
+        // return false because this session state provider does not support calling the Session_OnEnd event
         public override bool SetItemExpireCallback(SessionStateItemExpireCallback expireCallback)
         {
             return false;
@@ -76,14 +83,18 @@ namespace Redis.Web
 
         public override void ReleaseItemExclusive(HttpContext context, string id, object lockId)
         {
-            var cached = Database.StringGet(id);
+            var cacheKey = BuildCachingKey(id);
+            var cached = Database.StringGet(cacheKey);
             var item = DeserializeSessionItem(cached);
-            
+
+            if (item.LockId != (int) lockId)
+                return;
+
             item.Locked = false;
             item.Expires = DateTime.UtcNow.AddMinutes(_configSection.Timeout.TotalMinutes);
             cached = SerializeSessionItem(item);
 
-            Database.StringSet(id, cached);
+            Database.StringSet(cacheKey, cached);
         }
 
        
@@ -93,6 +104,7 @@ namespace Redis.Web
             var items = Serialize((SessionStateItemCollection) item.Items);
             string cached = string.Empty;
             SessionItem sessionItem = null;
+            string cacheKey = BuildCachingKey(id);
 
             if (newItem)
             {
@@ -112,8 +124,10 @@ namespace Redis.Web
             }
             else
             {
-                cached = Database.StringGet(id);
+                cached = Database.StringGet(cacheKey);
                 sessionItem = DeserializeSessionItem(cached);
+                if (sessionItem.LockId != (int) lockId)
+                    return;
                 sessionItem.Expires = DateTime.UtcNow.AddMinutes(item.Timeout);
                 sessionItem.Locked = false;
                 sessionItem.SessionItems = items;
@@ -122,32 +136,32 @@ namespace Redis.Web
             }
 
             cached = SerializeSessionItem(sessionItem);
-            Database.StringSet(id, cached);
+            Database.StringSet(cacheKey, cached);
         }
 
         public override void RemoveItem(HttpContext context, string id, object lockId, SessionStateStoreData item)
         {
-            
-            var cached = Database.StringGet(id);
+            var cacheKey = BuildCachingKey(id);
+            var cached = Database.StringGet(cacheKey);
             if (cached.IsNullOrEmpty)
                 return;
             var sessionItem = DeserializeSessionItem(cached);
             if (sessionItem.LockId == (int) lockId)
-                Database.KeyDelete(id);
+                Database.KeyDelete(cacheKey);
         }
 
         public override void ResetItemTimeout(HttpContext context, string id)
         {
             if (!Database.KeyExists(id))
                 return;
-
-            var cached = Database.StringGet(id);
+            var cacheKey = BuildCachingKey(id);
+            var cached = Database.StringGet(cacheKey);
             var sessionItem = DeserializeSessionItem(cached);
 
             sessionItem.Expires = DateTime.UtcNow.AddMinutes(_configSection.Timeout.TotalMinutes);
             cached = SerializeSessionItem(sessionItem);
 
-            Database.StringSet(id, cached);
+            Database.StringSet(cacheKey, cached);
         }
 
         public override SessionStateStoreData CreateNewStoreData(HttpContext context, int timeout)
@@ -170,11 +184,12 @@ namespace Redis.Web
                 LockId = 0,
                 Timeout = timeout,
                 SessionItems = string.Empty,
-                Flags = (int) SessionStateActions.None
+                Flags = (int) SessionStateActions.InitializeItem
                
             };
             var serialized = SerializeSessionItem(item);
-            Database.StringSet(id, serialized);
+            var cacheKey = BuildCachingKey(id);
+            Database.StringSet(cacheKey, serialized);
         }
 
         public override void EndRequest(HttpContext context)
@@ -196,12 +211,13 @@ namespace Redis.Web
             int timeout = 0;
             bool deleteData = false;
             bool foundRecord = false;
+            var cacheKey = BuildCachingKey(id);
 
             lockAge = TimeSpan.Zero;
             lockId = null;
             locked = false;
             actionFlags = SessionStateActions.None;
-            string cached = Database.StringGet(id);
+            string cached = Database.StringGet(cacheKey);
            
             if (string.IsNullOrEmpty(cached))
             {
@@ -213,14 +229,14 @@ namespace Redis.Web
             if (lockRecord)
             {
 
-
+                
                 if (cachedItem.Locked != true && cachedItem.Expires > DateTime.UtcNow)
                 {
                     cachedItem.Locked = true;
                     cachedItem.LockDate = DateTime.UtcNow;
 
                     cached = JsonConvert.SerializeObject(cachedItem);
-                    Database.StringSet(id, cached);
+                    Database.StringSet(cacheKey, cached);
                 }
                 else
                 {
@@ -248,7 +264,7 @@ namespace Redis.Web
             timeout = cachedItem.Timeout;
 
             if (deleteData)
-                Database.KeyDelete(id);
+                Database.KeyDelete(cacheKey);
 
             
             if (foundRecord && !locked)
@@ -257,7 +273,7 @@ namespace Redis.Web
                 cachedItem.LockId = (int) lockId;
                 cachedItem.Flags = (int) SessionStateActions.None;
                 cached = JsonConvert.SerializeObject(cachedItem);
-                Database.StringSet(id, cached);
+                Database.StringSet(cacheKey, cached);
 
                 if (actionFlags == SessionStateActions.InitializeItem)
                     item = CreateNewStoreData(context, (int) _configSection.Timeout.TotalMinutes);
@@ -306,6 +322,11 @@ namespace Redis.Web
         private static string SerializeSessionItem(SessionItem item)
         {
             return JsonConvert.SerializeObject(item);
+        }
+
+        private string BuildCachingKey(string id)
+        {
+            return string.Format("{0}:{1}", _applicationName, id);
         }
     }
 }
